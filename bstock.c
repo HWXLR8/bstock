@@ -3,6 +3,7 @@
 #include <curl/curl.h>
 #include <ctype.h>
 #include <math.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,9 @@ static const char *GREEN = "\033[38;2;0;255;0m", *RED = "\033[38;2;255;0;0m", *R
 static const char *BAND = "\033[48;2;39;39;39m";
 static const char *FG = "\033[39m";
 static const char *BOLD = "\033[1m";
+static const char *DIM = "\033[2m";
+
+static volatile sig_atomic_t stopping;
 
 typedef struct {
     char *buf;
@@ -33,7 +37,7 @@ typedef struct {
 
 typedef struct {
     double px, diff, ah_px, ah_diff;
-    int ah;
+    int ah, stale;
     char cur[4];
 } Quote;
 
@@ -226,6 +230,7 @@ static void row(const Hold *h, const Quote *q, int ah) {
     const char *fg = live ? (diff >= 0 ? GREEN : RED) : "";
     const char *clr = live ? FG : "";
     const char *band = live && fabs(pct) >= 2 ? BAND : "";
+    const char *dim = q->stale ? DIM : "", *off = q->stale ? RESET : "";
     char pc[32] = "", pl[32] = "", vl[32];
     money(px * h->shares, vl, sizeof vl, 0);
     if (live) {
@@ -233,8 +238,9 @@ static void row(const Hold *h, const Quote *q, int ah) {
         snprintf(pc, sizeof pc, "%s%%", money(pct, t, sizeof t, 1));
         money(diff * h->shares, pl, sizeof pl, 1);
     }
-    printf("%s%-10s %9.2f  %s%9s%s  %s%12s%s  %13s %s%s\n",
-           band, h->sym, px, fg, pc, clr, fg, pl, clr, vl, q->cur, *band ? RESET : "");
+    printf("%s%s%-10s %9.2f  %s%9s%s  %s%12s%s  %13s %s%s%s\n",
+           dim, band, h->sym, px, fg, pc, clr, fg, pl, clr, vl, q->cur,
+           *band ? RESET : "", off);
 }
 
 static void total(double day, double value) {
@@ -246,8 +252,91 @@ static void total(double day, double value) {
            money(value, v, sizeof v, 0), RESET);
 }
 
-int main(void) {
-    if (!isatty(STDOUT_FILENO)) GREEN = RED = RESET = BAND = FG = BOLD = "";
+static int render(const Book *bk, Quote *q, double fx_day, double fx_ah) {
+    double value = 0, day = 0, ah_day = 0, ah_value = 0;
+    int owned = 0, ah_any = 0;
+    for (size_t i = 0; i < bk->n; i++) {
+        double sh = bk->v[i].shares;
+        if (sh <= 0 || q[i].px <= 0) continue;
+        double r = !strcmp(q[i].cur, "CAD") ? 1 : fx_day;
+        double ra = !strcmp(q[i].cur, "CAD") ? 1 : fx_ah;
+        value += q[i].px * sh * r;
+        day += q[i].diff * sh * r;
+        if (q[i].ah) ah_any = 1;
+        else q[i].ah_px = q[i].px;
+        ah_value += q[i].ah_px * sh * ra;
+        owned = 1;
+    }
+    ah_day = ah_value - value;
+    if (!owned) return 0;
+    for (size_t i = 0; i < bk->n; i++)
+        if (bk->v[i].shares > 0 && q[i].px > 0) row(&bk->v[i], &q[i], 0);
+    total(day, value);
+    if (ah_any) {
+        printf("\n%sAFTER HOURS%s\n", BOLD, RESET);
+        for (size_t i = 0; i < bk->n; i++)
+            if (bk->v[i].shares > 0 && q[i].px > 0) row(&bk->v[i], &q[i], 1);
+        total(ah_day, ah_value);
+    }
+    return 1;
+}
+
+static void on_stop(int sig) {
+    (void)sig;
+    stopping = 1;
+}
+
+static void leave(void) {
+    fputs("\033[?25h\033[?1049l", stdout);
+    fflush(stdout);
+}
+
+static void nap(double sec) {
+    for (double t = 0; t < sec && !stopping; t += 0.1) usleep(100000);
+}
+
+static void refresh(const Book *bk, Quote *q, size_t i) {
+    Quote fresh;
+    if (fetch_quote(bk->v[i].sym, &fresh) != 0 || fresh.px <= 0) {
+        fresh = q[i];
+        fresh.stale = 1;
+    }
+    q[i] = fresh;
+}
+
+static void live(Book *bk, Quote *q, double fx_day, double fx_ah, double delay) {
+    signal(SIGINT, on_stop);
+    signal(SIGTERM, on_stop);
+    atexit(leave);
+    fputs("\033[?1049h\033[?25l", stdout);
+    while (!stopping) {
+        double r;
+        if (fetch_price("CAD=X", &r) == 0 && r > 0) fx_ah = r;
+        for (size_t i = 0; i < bk->n && !stopping; i++) {
+            if (bk->v[i].shares <= 0) continue;
+            refresh(bk, q, i);
+            int open = 1;
+            for (size_t j = 0; j < bk->n; j++)
+                if (bk->v[j].shares > 0 && q[j].px > 0 && q[j].ah) open = 0;
+            if (open) fx_day = fx_ah;
+            fputs("\033[H\033[J", stdout);
+            if (!render(bk, q, fx_day, fx_ah)) fputs("no price data\n", stdout);
+            fflush(stdout);
+            nap(delay);
+        }
+    }
+}
+
+int main(int argc, char **argv) {
+    int loop = isatty(STDOUT_FILENO);
+    double delay = 2;
+    int c;
+    while ((c = getopt(argc, argv, "i:")) != -1) {
+        if (c == 'i') delay = atof(optarg);
+        else die("usage: bstock [-i seconds]\n");
+    }
+    if (optind < argc || delay <= 0) die("usage: bstock [-i seconds]\n");
+    if (!loop) GREEN = RED = RESET = BAND = FG = BOLD = DIM = "";
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) die("curl init failed\n");
 
     Book bk = {0};
@@ -268,36 +357,13 @@ int main(void) {
         need_fx = 1;
     }
 
-    double fx = 0;
+    double fx = 0, fx_ah = 0;
     if (owned && need_fx && (fetch_price("CAD=X", &fx) != 0 || fx <= 0))
         die("no CAD rate\n");
+    fx_ah = fx;
 
-    double value = 0, day = 0, ah_day = 0, ah_value = 0;
-    int ah_any = 0;
-    for (size_t i = 0; i < bk.n; i++) {
-        double sh = bk.v[i].shares;
-        if (sh <= 0 || q[i].px <= 0) continue;
-        double r = !strcmp(q[i].cur, "CAD") ? 1 : fx;
-        value += q[i].px * sh * r;
-        day += q[i].diff * sh * r;
-        if (q[i].ah) ah_any = 1;
-        else q[i].ah_px = q[i].px;
-        ah_day += q[i].ah_diff * sh * r;
-        ah_value += q[i].ah_px * sh * r;
-    }
-
-    if (owned) {
-        for (size_t i = 0; i < bk.n; i++)
-            if (bk.v[i].shares > 0 && q[i].px > 0) row(&bk.v[i], &q[i], 0);
-        total(day, value);
-    }
-
-    if (ah_any) {
-        printf("\n%sAFTER HOURS%s\n", BOLD, RESET);
-        for (size_t i = 0; i < bk.n; i++)
-            if (bk.v[i].shares > 0 && q[i].px > 0) row(&bk.v[i], &q[i], 1);
-        total(ah_day, ah_value);
-    }
+    if (loop) live(&bk, q, fx, fx_ah, delay);
+    else render(&bk, q, fx, fx);
 
     free(q);
     free(bk.v);
